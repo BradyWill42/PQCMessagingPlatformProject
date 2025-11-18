@@ -3,7 +3,6 @@ import base64
 import requests
 
 from crypto_pqc import generate_pqc_keypair, pqc_encapsulate, pqc_encrypt, pqc_decrypt
-import oqs  # ensure installed
 
 
 SERVER = "http://127.0.0.1:8000"
