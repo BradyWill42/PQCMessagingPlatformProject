@@ -39,7 +39,7 @@ def pqc_encapsulate(peer_public_key: bytes) -> tuple[bytes, bytes]:
         raise RuntimeError("oqs-python (liboqs) not available")
 
     with oqs.KeyEncapsulation(KEM_ALG, peer_public_key) as kem:
-        kem_ciphertext, shared_secret = kem.encap_secret()
+        kem_ciphertext, shared_secret = kem.encap_secret(peer_public_key)
     return shared_secret, kem_ciphertext
 
 

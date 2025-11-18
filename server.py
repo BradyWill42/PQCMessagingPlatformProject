@@ -9,7 +9,7 @@ from typing import List
 
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-import jwt
+from jose import jwt, JWTError
 
 from models import (
     RegisterRequest, RegisterResponse,
