@@ -13,71 +13,6 @@ from client_key_manager import load_or_create_user_keys
 
 SERVER = "http://127.0.0.1:8000"
 
-def upload_encrypted_file(sender_name: str, sender_token: str, recipient: str, path: str):
-    """
-    Upload a file as multipart/form-data:
-      - server does PQC KEM + AES-GCM
-      - file is stored encrypted in SQL
-    """
-    if not os.path.exists(path):
-        raise FileNotFoundError(path)
-
-    with open(path, "rb") as f:
-        files = {
-            "file": (os.path.basename(path), f, "application/octet-stream")
-        }
-        data = {"recipient": recipient}
-        headers = {"Authorization": f"Bearer {sender_token}"}
-
-        resp = requests.post(f"{SERVER}/upload_file", files=files, data=data, headers=headers)
-        print(f"Upload response ({sender_name} → {recipient}):", resp.status_code, resp.text)
-        resp.raise_for_status()
-        return resp.json()
-
-def list_files(username: str, token: str):
-    headers = {"Authorization": f"Bearer {token}"}
-    resp = requests.get(f"{SERVER}/files", headers=headers)
-    resp.raise_for_status()
-    files = resp.json()
-    print(f"\n=== {username}'s file inbox ===")
-    for f in files:
-        print(f"- {f['id']} : {f['filename']} from {f['sender']}")
-    return files
-
-
-
-def download_and_decrypt_file(
-    username: str,
-    keypair,
-    token: str,
-    file_id: str,
-    out_path: str,
-):
-    headers = {"Authorization": f"Bearer {token}"}
-    resp = requests.get(f"{SERVER}/download_file/{file_id}", headers=headers)
-    resp.raise_for_status()
-    f_info = resp.json()
-
-    if f_info["recipient"] != username:
-        print(f"[!] {username} is not recipient of file {file_id}, won't decrypt")
-        return
-
-    kem_ct = b64d(f_info["kem_ciphertext_b64"])
-    nonce = b64d(f_info["nonce_b64"])
-    ct = b64d(f_info["ciphertext_b64"])
-    tag = b64d(f_info["tag_b64"])
-
-    shared_secret = pqc_decapsulate(kem_ct, keypair["secret_key"])
-    plaintext = pqc_decrypt(shared_secret, nonce, ct, tag)
-
-    with open(out_path, "wb") as out:
-        out.write(plaintext)
-    print("kem_ciphertext_b64 raw:", repr(f_info["kem_ciphertext_b64"]))
-    print("len:", len(f_info["kem_ciphertext_b64"]))
-
-    print(f"[OK] {username} decrypted file {file_id} to {out_path}")
-
-
 def b64e(b: bytes) -> str:
     return base64.b64encode(b).decode()
 
@@ -235,21 +170,3 @@ if __name__ == "__main__":
     fetch_and_decrypt_messages("alice", alice_kp, alice_token, box="inbox")
     fetch_and_decrypt_messages("bob", bob_kp, bob_token, box="inbox")
 
-
-    # --- File sharing test ---
-    test_path = "testfile_for_bob.txt"
-    with open(test_path, "wb") as f:
-        f.write(b"This is a PQC-encrypted file for Bob.\n")
-
-    upload_encrypted_file("alice", alice_token, "bob", test_path)
-
-    files_for_bob = list_files("bob", bob_token)
-    if files_for_bob:
-        first_id = files_for_bob[0]["id"]
-        download_and_decrypt_file(
-            "bob",
-            bob_kp,
-            bob_token,
-            first_id,
-            out_path="bob_downloaded_testfile.txt",
-        )

@@ -48,20 +48,3 @@ class MessageResponse(BaseModel):
     tag_b64: str
     aad_b64: Optional[str] = None
     timestamp: str
-
-class FileInfoResponse(BaseModel):
-    id: str
-    filename: str
-    sender: str
-    recipient: str
-    size: int
-    content_type: Optional[str]
-    kem_ciphertext_b64: str
-    nonce_b64: str
-    ciphertext_b64: str
-    tag_b64: str
-    aad_b64: Optional[str] = None
-    timestamp: datetime
-
-    class Config:
-        orm_mode = True
