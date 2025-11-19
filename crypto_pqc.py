@@ -20,6 +20,14 @@ class PQCKeyPair:
 
 # ---------- KEM: Kyber keypair / encaps / decaps ----------
 
+
+def _ensure_kem_supported():
+    enabled = oqs.get_enabled_kem_mechanisms()
+    if KEM_ALG not in enabled:
+        raise RuntimeError(f"KEM '{KEM_ALG}' not enabled in this liboqs build. Enabled: {enabled}")
+
+
+
 def generate_pqc_keypair() -> PQCKeyPair:
     if oqs is None:
         raise RuntimeError("oqs-python (liboqs) not available")
@@ -96,3 +104,54 @@ def pqc_decrypt(shared_secret: bytes, nonce: bytes, ciphertext: bytes, tag: byte
     keystream = _derive_keystream(shared_secret, nonce, len(ciphertext))
     plaintext = bytes(c ^ k for c, k in zip(ciphertext, keystream))
     return plaintext
+
+
+
+# -------------------------
+#  SIGNATURE: Dilithium3
+# -------------------------
+SIG_ALG = "Dilithium3"  # must be in oqs.get_enabled_sig_mechanisms()
+
+
+@dataclass
+class PQCSignatureKeyPair:
+    public_key: bytes
+    secret_key: bytes
+
+
+def _ensure_sig_supported():
+    enabled = oqs.get_enabled_sig_mechanisms()
+    if SIG_ALG not in enabled:
+        raise RuntimeError(f"Signature alg '{SIG_ALG}' not enabled. Enabled: {enabled}")
+
+
+def generate_pqc_sig_keypair() -> PQCSignatureKeyPair:
+    """
+    Generate a Dilithium3 signature keypair.
+    """
+    _ensure_sig_supported()
+    with oqs.Signature(SIG_ALG) as sig:
+        public_key = sig.generate_keypair()
+        secret_key = sig.export_secret_key()
+    return PQCSignatureKeyPair(public_key=public_key, secret_key=secret_key)
+
+
+def pqc_sign(message: bytes, secret_key: bytes) -> bytes:
+    """
+    Sign a message using Dilithium3.
+    """
+    _ensure_sig_supported()
+    with oqs.Signature(SIG_ALG) as sig:
+        sig.import_secret_key(secret_key)
+        signature = sig.sign(message)
+    return signature
+
+
+def pqc_verify(message: bytes, signature: bytes, public_key: bytes) -> bool:
+    """
+    Verify a Dilithium3 signature.
+    """
+    _ensure_sig_supported()
+    with oqs.Signature(SIG_ALG) as sig:
+        sig.import_public_key(public_key)
+        return sig.verify(message, signature)

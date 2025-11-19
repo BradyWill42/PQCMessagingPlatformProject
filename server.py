@@ -1,134 +1,281 @@
 # server.py
 from __future__ import annotations
 
-import os
-import uuid
 import base64
-from datetime import datetime, timedelta
-from typing import List
+import json
+import os
+import time
+import uuid
+from datetime import datetime
+from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from jose import jwt, JWTError
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, or_
 
+from database import Base, engine, get_db
+from models_sql import User, Message, FileRecord
 from models import (
     RegisterRequest, RegisterResponse,
     LoginRequest, LoginResponse,
     PQCPublicKeyResponse,
     SendMessageRequest, MessageResponse,
+    FileInfoResponse, FileDownloadResponse,
 )
 
-SECRET_JWT_KEY = os.environ.get("PQC_PLATFORM_JWT_SECRET", "dev-secret-key")  # change in prod
-JWT_ALG = "HS256"
+from crypto_pqc import (
+    PQCSignatureKeyPair,
+    generate_pqc_sig_keypair,
+    pqc_sign,
+    pqc_verify,
+)
 
-app = FastAPI(title="PQC-only Messaging & File Sharing")
+TOKEN_LIFETIME_SECONDS = 8 * 3600  # 8 hours
+
+app = FastAPI(title="PQC-only Messaging & File Sharing (Kyber768 + Dilithium3)")
 security = HTTPBearer()
 
-# In-memory DBs for example purposes
-USERS: dict[str, dict] = {}  # username -> {password, pqc_public_key (bytes)}
-MESSAGES: list[dict] = []    # each is a message record
-FILES: dict[str, dict] = {}  # file_id -> {uploader, recipient, kem_ciphertext_b64, ...}
-
-STORAGE_DIR = "storage"
-os.makedirs(STORAGE_DIR, exist_ok=True)
+# Server-wide PQC signing keypair (Dilithium3)
+SERVER_SIG_KEYS: PQCSignatureKeyPair | None = None
 
 
-# ---------- Auth helpers ----------
+def b64url_encode(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
 
-def create_access_token(username: str, expires_delta: timedelta = timedelta(hours=8)) -> str:
+
+def b64url_decode(s: str) -> bytes:
+    padding = "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s + padding)
+
+
+def init_server_sig_keys():
+    global SERVER_SIG_KEYS
+    if SERVER_SIG_KEYS is None:
+        SERVER_SIG_KEYS = generate_pqc_sig_keypair()
+
+
+@app.on_event("startup")
+async def on_startup():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    init_server_sig_keys()
+
+
+# ------------- PQC token (Dilithium3-signed) -------------
+
+
+def create_pqc_token(username: str, lifetime: int = TOKEN_LIFETIME_SECONDS) -> str:
+    """
+    Create a JWT-like token signed with Dilithium3.
+    Format: base64url(header).base64url(payload).base64url(signature)
+    """
+    assert SERVER_SIG_KEYS is not None
+    now = int(time.time())
+    header = {
+        "alg": "Dilithium3",  # matches SIG_ALG in crypto_pqc.py
+        "typ": "PQCJWT",
+    }
     payload = {
         "sub": username,
-        "exp": datetime.utcnow() + expires_delta
+        "iat": now,
+        "exp": now + lifetime,
     }
-    token = jwt.encode(payload, SECRET_JWT_KEY, algorithm=JWT_ALG)
-    return token
+
+    header_b = json.dumps(header, separators=(",", ":")).encode()
+    payload_b = json.dumps(payload, separators=(",", ":")).encode()
+
+    header_b64 = b64url_encode(header_b)
+    payload_b64 = b64url_encode(payload_b)
+
+    signing_input = (header_b64 + "." + payload_b64).encode()
+
+    signature = pqc_sign(signing_input, SERVER_SIG_KEYS.secret_key)
+    sig_b64 = b64url_encode(signature)
+
+    return header_b64 + "." + payload_b64 + "." + sig_b64
+
+
+def verify_pqc_token(token: str) -> str:
+    """
+    Verify a Dilithium3-signed token and return username (sub).
+    Raises HTTPException on failure.
+    """
+    assert SERVER_SIG_KEYS is not None
+    try:
+        header_b64, payload_b64, sig_b64 = token.split(".")
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid token format")
+
+    signing_input = (header_b64 + "." + payload_b64).encode()
+    signature = b64url_decode(sig_b64)
+
+    header = json.loads(b64url_decode(header_b64))
+    payload = json.loads(b64url_decode(payload_b64))
+
+    if header.get("alg") != "Dilithium3":
+        raise HTTPException(status_code=401, detail="Unexpected token algorithm")
+
+    ok = pqc_verify(signing_input, signature, SERVER_SIG_KEYS.public_key)
+    if not ok:
+        raise HTTPException(status_code=401, detail="Invalid token signature")
+
+    now = int(time.time())
+    if now > int(payload.get("exp", 0)):
+        raise HTTPException(status_code=401, detail="Token expired")
+
+    sub = payload.get("sub")
+    if not sub:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+
+    return sub
 
 
 def get_current_user(creds: HTTPAuthorizationCredentials = Depends(security)) -> str:
     token = creds.credentials
-    try:
-        payload = jwt.decode(token, SECRET_JWT_KEY, algorithms=[JWT_ALG])
-        return payload["sub"]
-    except jwt.PyJWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+    return verify_pqc_token(token)
 
 
-# ---------- User endpoints ----------
+# ---------------- User endpoints ----------------
 
 @app.post("/register", response_model=RegisterResponse)
-def register(req: RegisterRequest):
-    if req.username in USERS:
+async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(User).where(User.username == req.username))
+    existing = result.scalar_one_or_none()
+    if existing:
         raise HTTPException(status_code=400, detail="Username already exists")
 
-    pqc_pub = base64.b64decode(req.pqc_public_key_b64)
-
-    USERS[req.username] = {
-        "password": req.password,
-        "pqc_public_key": pqc_pub,
-    }
+    user = User(
+        username=req.username,
+        password=req.password,  # TODO: hash in real deployment
+        pqc_public_key_b64=req.pqc_public_key_b64,
+    )
+    db.add(user)
+    await db.commit()
     return RegisterResponse(user_id=req.username)
 
 
 @app.post("/login", response_model=LoginResponse)
-def login(req: LoginRequest):
-    user = USERS.get(req.username)
-    if not user or user["password"] != req.password:
+async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(User).where(User.username == req.username))
+    user = result.scalar_one_or_none()
+    if not user or user.password != req.password:
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    token = create_access_token(req.username)
+    token = create_pqc_token(req.username)
     return LoginResponse(access_token=token)
 
 
 @app.get("/pqc_public_key/{username}", response_model=PQCPublicKeyResponse)
-def get_pqc_public_key(username: str):
-    user = USERS.get(username)
+async def get_pqc_public_key(username: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(User).where(User.username == username))
+    user = result.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    if not user["pqc_public_key"]:
-        raise HTTPException(status_code=404, detail="User PQC key not set")
 
     return PQCPublicKeyResponse(
         username=username,
-        public_key_pqc=base64.b64encode(user["pqc_public_key"]).decode()
+        public_key_pqc=user.pqc_public_key_b64,
     )
 
 
-# ---------- Messaging endpoints (E2E PQC) ----------
+# ---------------- Messaging endpoints ----------------
 
 @app.post("/send_message", response_model=MessageResponse)
-def send_message(req: SendMessageRequest, current_user: str = Depends(get_current_user)):
-    if req.recipient not in USERS:
+async def send_message(
+    req: SendMessageRequest,
+    current_user: str = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(User).where(User.username == req.recipient))
+    recipient = result.scalar_one_or_none()
+    if not recipient:
         raise HTTPException(status_code=404, detail="Recipient not found")
 
     msg_id = str(uuid.uuid4())
-    record = {
-        "id": msg_id,
-        "sender": current_user,
-        "recipient": req.recipient,
-        "kem_ciphertext_b64": req.kem_ciphertext_b64,
-        "nonce_b64": req.nonce_b64,
-        "ciphertext_b64": req.ciphertext_b64,
-        "tag_b64": req.tag_b64,
-        "aad_b64": req.aad_b64,
-        "timestamp": datetime.utcnow().isoformat(),
-    }
-    MESSAGES.append(record)
-    return MessageResponse(**record)
+
+    msg = Message(
+        id=msg_id,
+        sender=current_user,
+        recipient=req.recipient,
+        kem_ciphertext_b64=req.kem_ciphertext_b64,
+        nonce_b64=req.nonce_b64,
+        ciphertext_b64=req.ciphertext_b64,
+        tag_b64=req.tag_b64,
+        aad_b64=req.aad_b64,
+    )
+    db.add(msg)
+    await db.commit()
+    await db.refresh(msg)
+
+    return MessageResponse(
+        id=msg.id,
+        sender=msg.sender,
+        recipient=msg.recipient,
+        kem_ciphertext_b64=msg.kem_ciphertext_b64,
+        nonce_b64=msg.nonce_b64,
+        ciphertext_b64=msg.ciphertext_b64,
+        tag_b64=msg.tag_b64,
+        aad_b64=msg.aad_b64,
+        timestamp=msg.timestamp.isoformat(),
+    )
 
 
 @app.get("/inbox", response_model=List[MessageResponse])
-def inbox(current_user: str = Depends(get_current_user)):
-    msgs = [m for m in MESSAGES if m["recipient"] == current_user]
-    return [MessageResponse(**m) for m in msgs]
+async def inbox(
+    current_user: str = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Message)
+        .where(Message.recipient == current_user)
+        .order_by(Message.timestamp.desc())
+    )
+    rows = result.scalars().all()
+    return [
+        MessageResponse(
+            id=m.id,
+            sender=m.sender,
+            recipient=m.recipient,
+            kem_ciphertext_b64=m.kem_ciphertext_b64,
+            nonce_b64=m.nonce_b64,
+            ciphertext_b64=m.ciphertext_b64,
+            tag_b64=m.tag_b64,
+            aad_b64=m.aad_b64,
+            timestamp=m.timestamp.isoformat(),
+        )
+        for m in rows
+    ]
 
 
 @app.get("/sent", response_model=List[MessageResponse])
-def sent(current_user: str = Depends(get_current_user)):
-    msgs = [m for m in MESSAGES if m["sender"] == current_user]
-    return [MessageResponse(**m) for m in msgs]
+async def sent(
+    current_user: str = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Message)
+        .where(Message.sender == current_user)
+        .order_by(Message.timestamp.desc())
+    )
+    rows = result.scalars().all()
+    return [
+        MessageResponse(
+            id=m.id,
+            sender=m.sender,
+            recipient=m.recipient,
+            kem_ciphertext_b64=m.kem_ciphertext_b64,
+            nonce_b64=m.nonce_b64,
+            ciphertext_b64=m.ciphertext_b64,
+            tag_b64=m.tag_b64,
+            aad_b64=m.aad_b64,
+            timestamp=m.timestamp.isoformat(),
+        )
+        for m in rows
+    ]
 
 
-# ---------- File sharing endpoints (PQC ciphertext only) ----------
+# ---------------- File sharing (ciphertext in SQL) ----------------
 
 @app.post("/upload_file")
 async def upload_file(
@@ -136,77 +283,91 @@ async def upload_file(
     kem_ciphertext_b64: str = Form(...),
     nonce_b64: str = Form(...),
     tag_b64: str = Form(...),
-    aad_b64: str | None = Form(None),
+    aad_b64: Optional[str] = Form(None),
     file: UploadFile = File(...),
     current_user: str = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
-    if recipient not in USERS:
+    result = await db.execute(select(User).where(User.username == recipient))
+    recipient_user = result.scalar_one_or_none()
+    if not recipient_user:
         raise HTTPException(status_code=404, detail="Recipient not found")
 
+    data = await file.read()  # encrypted bytes
+
     file_id = str(uuid.uuid4())
-    filename = f"{file_id}.bin"
-    path = os.path.join(STORAGE_DIR, filename)
+    record = FileRecord(
+        id=file_id,
+        uploader=current_user,
+        recipient=recipient,
+        kem_ciphertext_b64=kem_ciphertext_b64,
+        nonce_b64=nonce_b64,
+        tag_b64=tag_b64,
+        aad_b64=aad_b64,
+        original_filename=file.filename,
+        ciphertext=data,
+    )
+    db.add(record)
+    await db.commit()
 
-    # We assume client already encrypted file content using pqc_encrypt
-    # and is sending *ciphertext* here.
-    data = await file.read()
-    with open(path, "wb") as f:
-        f.write(data)
-
-    FILES[file_id] = {
-        "uploader": current_user,
-        "recipient": recipient,
-        "kem_ciphertext_b64": kem_ciphertext_b64,
-        "nonce_b64": nonce_b64,
-        "tag_b64": tag_b64,
-        "aad_b64": aad_b64,
-        "path": path,
-        "original_filename": file.filename,
-        "timestamp": datetime.utcnow().isoformat(),
-    }
     return {"file_id": file_id}
 
 
-@app.get("/files")
-def list_files(current_user: str = Depends(get_current_user)):
-    # list ciphertext files the user can decrypt
-    accessible = [
-        {"file_id": fid,
-         "uploader": meta["uploader"],
-         "recipient": meta["recipient"],
-         "original_filename": meta["original_filename"],
-         "kem_ciphertext_b64": meta["kem_ciphertext_b64"],
-         "nonce_b64": meta["nonce_b64"],
-         "tag_b64": meta["tag_b64"],
-         "aad_b64": meta["aad_b64"],
-         "timestamp": meta["timestamp"],
-        }
-        for fid, meta in FILES.items()
-        if meta["recipient"] == current_user or meta["uploader"] == current_user
+@app.get("/files", response_model=List[FileInfoResponse])
+async def list_files(
+    current_user: str = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(FileRecord)
+        .where(
+            or_(
+                FileRecord.uploader == current_user,
+                FileRecord.recipient == current_user,
+            )
+        )
+        .order_by(FileRecord.timestamp.desc())
+    )
+    rows = result.scalars().all()
+    return [
+        FileInfoResponse(
+            file_id=f.id,
+            uploader=f.uploader,
+            recipient=f.recipient,
+            original_filename=f.original_filename,
+            kem_ciphertext_b64=f.kem_ciphertext_b64,
+            nonce_b64=f.nonce_b64,
+            tag_b64=f.tag_b64,
+            aad_b64=f.aad_b64,
+            timestamp=f.timestamp.isoformat() if f.timestamp else "",
+        )
+        for f in rows
     ]
-    return accessible
 
 
-@app.get("/download_file/{file_id}")
-def download_file(file_id: str, current_user: str = Depends(get_current_user)):
-    meta = FILES.get(file_id)
-    if not meta:
+@app.get("/download_file/{file_id}", response_model=FileDownloadResponse)
+async def download_file(
+    file_id: str,
+    current_user: str = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(FileRecord).where(FileRecord.id == file_id))
+    f = result.scalar_one_or_none()
+    if not f:
         raise HTTPException(status_code=404, detail="File not found")
 
-    if current_user not in (meta["recipient"], meta["uploader"]):
+    if current_user not in (f.uploader, f.recipient):
         raise HTTPException(status_code=403, detail="Not allowed")
 
-    with open(meta["path"], "rb") as f:
-        data = f.read()
-
-    # We return ciphertext; client decrypts using shared_secret and pqc_decrypt.
-    return {
-        "file_id": file_id,
-        "ciphertext_b64": base64.b64encode(data).decode(),
-        "kem_ciphertext_b64": meta["kem_ciphertext_b64"],
-        "nonce_b64": meta["nonce_b64"],
-        "tag_b64": meta["tag_b64"],
-        "aad_b64": meta["aad_b64"],
-        "original_filename": meta["original_filename"],
-        "timestamp": meta["timestamp"],
-    }
+    return FileDownloadResponse(
+        file_id=f.id,
+        uploader=f.uploader,
+        recipient=f.recipient,
+        original_filename=f.original_filename,
+        ciphertext_b64=base64.b64encode(f.ciphertext).decode(),
+        kem_ciphertext_b64=f.kem_ciphertext_b64,
+        nonce_b64=f.nonce_b64,
+        tag_b64=f.tag_b64,
+        aad_b64=f.aad_b64,
+        timestamp=f.timestamp.isoformat() if f.timestamp else "",
+    )

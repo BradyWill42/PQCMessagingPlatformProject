@@ -15,6 +15,14 @@ def b64e(b: bytes) -> str:
 def b64d(s: str) -> bytes:
     return base64.b64decode(s.encode())
 
+def decrypt_and_print(shared_secret, nonce, ciphertext, tag):
+    plaintext = pqc_decrypt(shared_secret, nonce, ciphertext, tag)
+    try:
+        print("Decrypted plaintext:", plaintext.decode())
+    except UnicodeDecodeError:
+        # if it's not UTF-8 text, just show raw bytes
+        print("Decrypted plaintext (bytes):", plaintext)
+
 
 def register_and_login(username: str, password: str):
     kp = generate_pqc_keypair()
@@ -56,13 +64,17 @@ if __name__ == "__main__":
     alice_kp, alice_token = register_and_login("alice", "alicepw")
     bob_kp, bob_token = register_and_login("bob", "bobpw")
 
+    #Enabled SIGS
+
+    print("Enabled SIGs:", oqs.Signature.algorithms)
+
     # Alice fetches Bob's Kyber public key
     bob_pub = get_peer_public_key("bob")
 
     # Alice encapsulates to Bob -> PQC shared_secret + kem_ciphertext
     shared_secret, kem_ct = pqc_encapsulate(bob_pub)
 
-    msg = b"Hello Bob, this is PQC-only!"
+    msg = b"Hello Bob, Im not a big fan of 3"
 
     nonce, ciphertext, tag = pqc_encrypt(shared_secret, msg)
 
@@ -77,3 +89,8 @@ if __name__ == "__main__":
     }, headers=headers)
     r.raise_for_status()
     print("Message sent:", r.json())
+    decrypt_and_print(shared_secret, nonce, ciphertext, tag)
+
+
+
+

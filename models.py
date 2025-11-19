@@ -46,3 +46,18 @@ class MessageResponse(BaseModel):
     tag_b64: str
     aad_b64: str | None = None
     timestamp: str
+
+class FileInfoResponse(BaseModel):
+    file_id: str
+    uploader: str
+    recipient: str
+    original_filename: str
+    kem_ciphertext_b64: str
+    nonce_b64: str
+    tag_b64: str
+    aad_b64: Optional[str] = None
+    timestamp: str
+
+
+class FileDownloadResponse(FileInfoResponse):
+    ciphertext_b64: str
