@@ -1,8 +1,9 @@
 # models_sql.py
-from sqlalchemy import Column, Integer, String, DateTime, Text, LargeBinary
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, LargeBinary
 from sqlalchemy.sql import func
+from sqlalchemy.orm import relationship
 from database import Base
-
+import uuid
 
 class User(Base):
     __tablename__ = "users"
@@ -28,22 +29,25 @@ class Message(Base):
 
     timestamp = Column(DateTime(timezone=True), server_default=func.now())
 
-
 class FileRecord(Base):
     __tablename__ = "files"
 
-    id = Column(String(64), primary_key=True, index=True)  # UUID
-    uploader = Column(String(64), index=True, nullable=False)
-    recipient = Column(String(64), index=True, nullable=False)
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    sender = Column(String, ForeignKey("users.username"), nullable=False)
+    recipient = Column(String, ForeignKey("users.username"), nullable=False)
 
-    kem_ciphertext_b64 = Column(Text, nullable=False)
-    nonce_b64 = Column(Text, nullable=False)
-    tag_b64 = Column(Text, nullable=False)
-    aad_b64 = Column(Text, nullable=True)
+    filename = Column(String, nullable=False)
+    content_type = Column(String, nullable=True)
+    size = Column(Integer, nullable=False)
 
-    original_filename = Column(String(255), nullable=False)
-
-    # Encrypted file bytes stored directly in SQL
+    # PQC-wrapped key and AES-GCM ciphertext
+    kem_ciphertext = Column(LargeBinary, nullable=False)
+    nonce = Column(LargeBinary, nullable=False)
     ciphertext = Column(LargeBinary, nullable=False)
+    tag = Column(LargeBinary, nullable=False)
+    aad = Column(LargeBinary, nullable=True)
 
-    timestamp = Column(DateTime(timezone=True), server_default=func.now())
+    timestamp = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    sender_user = relationship("User", foreign_keys=[sender])
+    recipient_user = relationship("User", foreign_keys=[recipient])

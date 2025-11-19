@@ -1,0 +1,2 @@
+This is a PQC-encrypted file for Bob.
+If you can read this, Kyber + AES-GCM for files works.

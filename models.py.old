@@ -1,7 +1,5 @@
 # models.py
-from datetime import datetime
 from pydantic import BaseModel
-from typing import Optional
 
 
 class RegisterRequest(BaseModel):
@@ -26,7 +24,7 @@ class LoginResponse(BaseModel):
 
 class PQCPublicKeyResponse(BaseModel):
     username: str
-    public_key_pqc: str
+    public_key_pqc: str  # base64
 
 
 class SendMessageRequest(BaseModel):
@@ -35,7 +33,7 @@ class SendMessageRequest(BaseModel):
     nonce_b64: str
     ciphertext_b64: str
     tag_b64: str
-    aad_b64: Optional[str] = None
+    aad_b64: str | None = None
 
 
 class MessageResponse(BaseModel):
@@ -46,22 +44,20 @@ class MessageResponse(BaseModel):
     nonce_b64: str
     ciphertext_b64: str
     tag_b64: str
-    aad_b64: Optional[str] = None
+    aad_b64: str | None = None
     timestamp: str
 
 class FileInfoResponse(BaseModel):
-    id: str
-    filename: str
-    sender: str
+    file_id: str
+    uploader: str
     recipient: str
-    size: int
-    content_type: Optional[str]
+    original_filename: str
     kem_ciphertext_b64: str
     nonce_b64: str
-    ciphertext_b64: str
     tag_b64: str
     aad_b64: Optional[str] = None
-    timestamp: datetime
+    timestamp: str
 
-    class Config:
-        orm_mode = True
+
+class FileDownloadResponse(FileInfoResponse):
+    ciphertext_b64: str

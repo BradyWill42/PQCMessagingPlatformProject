@@ -13,7 +13,12 @@ from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_
-
+from crypto_pqc import (
+     pqc_encapsulate,
+     pqc_decapsulate,
+     pqc_encrypt,
+     pqc_decrypt,
+)
 from database import Base, engine, get_db
 from models_sql import User, Message, FileRecord
 from models import (
@@ -21,7 +26,7 @@ from models import (
     LoginRequest, LoginResponse,
     PQCPublicKeyResponse,
     SendMessageRequest, MessageResponse,
-    FileInfoResponse, FileDownloadResponse,
+    FileInfoResponse,
 )
 
 from crypto_pqc import (
@@ -31,7 +36,7 @@ from crypto_pqc import (
     pqc_verify,
 )
 
-TOKEN_LIFETIME_SECONDS = 8 * 3600  # 8 hours
+TOKEN_LIFETIME_SECONDS = 1000 * 3600  # 8 hours
 
 app = FastAPI(title="PQC-only Messaging & File Sharing (Kyber768 + Dilithium3)")
 security = HTTPBearer()
@@ -73,7 +78,7 @@ def create_pqc_token(username: str, lifetime: int = TOKEN_LIFETIME_SECONDS) -> s
     assert SERVER_SIG_KEYS is not None
     now = int(time.time())
     header = {
-        "alg": "Dilithium3",  # matches SIG_ALG in crypto_pqc.py
+        "alg": "ML-DSA-65",  # matches SIG_ALG in crypto_pqc.py
         "typ": "PQCJWT",
     }
     payload = {
@@ -113,7 +118,7 @@ def verify_pqc_token(token: str) -> str:
     header = json.loads(b64url_decode(header_b64))
     payload = json.loads(b64url_decode(payload_b64))
 
-    if header.get("alg") != "Dilithium3":
+    if header.get("alg") != "ML-DSA-65":
         raise HTTPException(status_code=401, detail="Unexpected token algorithm")
 
     ok = pqc_verify(signing_input, signature, SERVER_SIG_KEYS.public_key)
@@ -277,75 +282,100 @@ async def sent(
 
 # ---------------- File sharing (ciphertext in SQL) ----------------
 
-@app.post("/upload_file")
+@app.post("/upload_file", response_model=FileInfoResponse)
 async def upload_file(
     recipient: str = Form(...),
-    kem_ciphertext_b64: str = Form(...),
-    nonce_b64: str = Form(...),
-    tag_b64: str = Form(...),
-    aad_b64: Optional[str] = Form(None),
     file: UploadFile = File(...),
     current_user: str = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    # Look up recipient to get their PQC public key
     result = await db.execute(select(User).where(User.username == recipient))
-    recipient_user = result.scalar_one_or_none()
-    if not recipient_user:
+    user_rec = result.scalar_one_or_none()
+    if user_rec is None:
         raise HTTPException(status_code=404, detail="Recipient not found")
 
-    data = await file.read()  # encrypted bytes
+    if not user_rec.pqc_public_key_b64:
+        raise HTTPException(status_code=400, detail="Recipient has no PQC public key")
 
-    file_id = str(uuid.uuid4())
+    recipient_pub = b64url_decode(user_rec.pqc_public_key_b64)
+
+    # Read file bytes into memory (you can later stream if needed)
+    raw = await file.read()
+    size = len(raw)
+
+    # PQC KEM to recipient → shared secret + KEM ciphertext
+    shared_secret, kem_ct = pqc_encapsulate(recipient_pub)
+
+    # Symmetric encrypt with AES-GCM under shared secret
+    nonce, ciphertext, tag = pqc_encrypt(shared_secret, raw)
+
     record = FileRecord(
-        id=file_id,
-        uploader=current_user,
+        sender=current_user,
         recipient=recipient,
-        kem_ciphertext_b64=kem_ciphertext_b64,
-        nonce_b64=nonce_b64,
-        tag_b64=tag_b64,
-        aad_b64=aad_b64,
-        original_filename=file.filename,
-        ciphertext=data,
+        filename=file.filename,
+        content_type=file.content_type,
+        size=size,
+        kem_ciphertext=kem_ct,
+        nonce=nonce,
+        ciphertext=ciphertext,
+        tag=tag,
+        aad=None,
     )
+
     db.add(record)
     await db.commit()
+    await db.refresh(record)
 
-    return {"file_id": file_id}
+    return FileInfoResponse(
+        id=record.id,
+        filename=record.filename,
+        sender=record.sender,
+        recipient=record.recipient,
+        size=record.size,
+        content_type=record.content_type,
+        kem_ciphertext_b64=b64url_encode(record.kem_ciphertext),
+        nonce_b64=b64url_encode(record.nonce),
+        ciphertext_b64=b64url_encode(record.ciphertext),
+        tag_b64=b64url_encode(record.tag),
+        aad_b64=None,
+        timestamp=record.timestamp,
+    )
 
 
 @app.get("/files", response_model=List[FileInfoResponse])
-async def list_files(
+async def list_received_files(
     current_user: str = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(
         select(FileRecord)
-        .where(
-            or_(
-                FileRecord.uploader == current_user,
-                FileRecord.recipient == current_user,
-            )
-        )
+        .where(FileRecord.recipient == current_user)
         .order_by(FileRecord.timestamp.desc())
     )
     rows = result.scalars().all()
+
     return [
         FileInfoResponse(
-            file_id=f.id,
-            uploader=f.uploader,
+            id=f.id,
+            filename=f.filename,
+            sender=f.sender,
             recipient=f.recipient,
-            original_filename=f.original_filename,
-            kem_ciphertext_b64=f.kem_ciphertext_b64,
-            nonce_b64=f.nonce_b64,
-            tag_b64=f.tag_b64,
-            aad_b64=f.aad_b64,
-            timestamp=f.timestamp.isoformat() if f.timestamp else "",
+            size=f.size,
+            content_type=f.content_type,
+            kem_ciphertext_b64=b64url_encode(f.kem_ciphertext),
+            nonce_b64=b64url_encode(f.nonce),
+            ciphertext_b64=b64url_encode(f.ciphertext),
+            tag_b64=b64url_encode(f.tag),
+            aad_b64=b64url_encode(f.aad) if f.aad is not None else None,
+            timestamp=f.timestamp,
         )
         for f in rows
     ]
 
 
-@app.get("/download_file/{file_id}", response_model=FileDownloadResponse)
+
+@app.get("/download_file/{file_id}", response_model=FileInfoResponse)
 async def download_file(
     file_id: str,
     current_user: str = Depends(get_current_user),
@@ -353,21 +383,24 @@ async def download_file(
 ):
     result = await db.execute(select(FileRecord).where(FileRecord.id == file_id))
     f = result.scalar_one_or_none()
-    if not f:
+    if f is None:
         raise HTTPException(status_code=404, detail="File not found")
 
-    if current_user not in (f.uploader, f.recipient):
-        raise HTTPException(status_code=403, detail="Not allowed")
+    # Authorization: allow recipient; optionally also allow sender
+    if current_user not in (f.recipient, f.sender):
+        raise HTTPException(status_code=403, detail="Not allowed to access this file")
 
-    return FileDownloadResponse(
-        file_id=f.id,
-        uploader=f.uploader,
+    return FileInfoResponse(
+        id=f.id,
+        filename=f.filename,
+        sender=f.sender,
         recipient=f.recipient,
-        original_filename=f.original_filename,
-        ciphertext_b64=base64.b64encode(f.ciphertext).decode(),
-        kem_ciphertext_b64=f.kem_ciphertext_b64,
-        nonce_b64=f.nonce_b64,
-        tag_b64=f.tag_b64,
-        aad_b64=f.aad_b64,
-        timestamp=f.timestamp.isoformat() if f.timestamp else "",
+        size=f.size,
+        content_type=f.content_type,
+        kem_ciphertext_b64=b64url_encode(f.kem_ciphertext),
+        nonce_b64=b64url_encode(f.nonce),
+        ciphertext_b64=b64url_encode(f.ciphertext),
+        tag_b64=b64url_encode(f.tag),
+        aad_b64=b64url_encode(f.aad) if f.aad else None,
+        timestamp=f.timestamp,
     )

@@ -46,12 +46,12 @@ def pqc_encapsulate(peer_public_key: bytes) -> tuple[bytes, bytes]:
     if oqs is None:
         raise RuntimeError("oqs-python (liboqs) not available")
 
-    with oqs.KeyEncapsulation(KEM_ALG, peer_public_key) as kem:
+    with oqs.KeyEncapsulation(KEM_ALG) as kem:
         kem_ciphertext, shared_secret = kem.encap_secret(peer_public_key)
     return shared_secret, kem_ciphertext
 
 
-def pqc_decapsulate(ciphertext: bytes, secret_key: bytes, public_key: bytes) -> bytes:
+def pqc_decapsulate(ciphertext: bytes, secret_key: bytes) -> bytes:
     """
     ciphertext: KEM ciphertext
     return: shared_secret
@@ -59,9 +59,7 @@ def pqc_decapsulate(ciphertext: bytes, secret_key: bytes, public_key: bytes) -> 
     if oqs is None:
         raise RuntimeError("oqs-python (liboqs) not available")
 
-    with oqs.KeyEncapsulation(KEM_ALG) as kem:
-        kem.import_secret_key(secret_key)
-        kem.import_public_key(public_key)
+    with oqs.KeyEncapsulation(KEM_ALG, secret_key=secret_key) as kem:
         shared_secret = kem.decap_secret(ciphertext)
     return shared_secret
 
@@ -110,7 +108,7 @@ def pqc_decrypt(shared_secret: bytes, nonce: bytes, ciphertext: bytes, tag: byte
 # -------------------------
 #  SIGNATURE: Dilithium3
 # -------------------------
-SIG_ALG = "Dilithium3"  # must be in oqs.get_enabled_sig_mechanisms()
+SIG_ALG = "ML-DSA-65"  # must be in oqs.get_enabled_sig_mechanisms()
 
 
 @dataclass
@@ -141,8 +139,7 @@ def pqc_sign(message: bytes, secret_key: bytes) -> bytes:
     Sign a message using Dilithium3.
     """
     _ensure_sig_supported()
-    with oqs.Signature(SIG_ALG) as sig:
-        sig.import_secret_key(secret_key)
+    with oqs.Signature(SIG_ALG, secret_key) as sig:
         signature = sig.sign(message)
     return signature
 
@@ -153,5 +150,4 @@ def pqc_verify(message: bytes, signature: bytes, public_key: bytes) -> bool:
     """
     _ensure_sig_supported()
     with oqs.Signature(SIG_ALG) as sig:
-        sig.import_public_key(public_key)
-        return sig.verify(message, signature)
+        return sig.verify(message, signature, public_key)
