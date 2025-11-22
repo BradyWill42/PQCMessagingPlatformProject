@@ -28,26 +28,3 @@ class Message(Base):
     aad_b64 = Column(Text, nullable=True)
 
     timestamp = Column(DateTime(timezone=True), server_default=func.now())
-
-class FileRecord(Base):
-    __tablename__ = "files"
-
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    sender = Column(String, ForeignKey("users.username"), nullable=False)
-    recipient = Column(String, ForeignKey("users.username"), nullable=False)
-
-    filename = Column(String, nullable=False)
-    content_type = Column(String, nullable=True)
-    size = Column(Integer, nullable=False)
-
-    # PQC-wrapped key and AES-GCM ciphertext
-    kem_ciphertext = Column(LargeBinary, nullable=False)
-    nonce = Column(LargeBinary, nullable=False)
-    ciphertext = Column(LargeBinary, nullable=False)
-    tag = Column(LargeBinary, nullable=False)
-    aad = Column(LargeBinary, nullable=True)
-
-    timestamp = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-
-    sender_user = relationship("User", foreign_keys=[sender])
-    recipient_user = relationship("User", foreign_keys=[recipient])

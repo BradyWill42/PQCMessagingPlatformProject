@@ -20,7 +20,7 @@ from crypto_pqc import (
      pqc_decrypt,
 )
 from database import Base, engine, get_db
-from models_sql import User, Message, FileRecord
+from models_sql import User, Message
 from models import (
     RegisterRequest, RegisterResponse,
     LoginRequest, LoginResponse,
